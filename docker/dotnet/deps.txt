@@ -1,9 +1,9 @@
 # Downloads for the esystem-dotnet image: wkhtmltopdf and the two libraries it
 # links that Ubuntu noble lacks, and Microsoft's Core fonts cabinets (the same
 # hashes as Debian's msttcorefonts). A file of that name in this directory is
-# used as is; otherwise each address is tried in order. Either way it must
-# match the sha256.
-# <name>          <sha256>                                                          <addresses>
+# used as is; otherwise it is downloaded. Either way it must match the
+# sha256.
+# <name>          <sha256>                                                          <address>
 libssl1.1.deb     7cf39d70a639017d1dd7c8d36daa2258063608688e449fddf40ffdd46f992a78  http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.1_1.1.1f-1ubuntu2.24_amd64.deb
 libjpeg62.deb     95ec30140789a342add8f8371ed018924de51b539056522b66f207b25cba9cad  http://deb.debian.org/debian/pool/main/libj/libjpeg-turbo/libjpeg62-turbo_2.1.5-2_amd64.deb
 wkhtmltox.deb     4f723b2691ad8638a9df960e0421d346d7315083e3583a334f33362280ddba15  https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_amd64.deb

@@ -2,12 +2,13 @@
 # install-cert: install a TLS certificate for nginx and reload it.
 #
 #   bin/install-cert site.pfx             # .pfx / .p12; asks for its password
-#   bin/install-cert cert.pem key.pem     # certificate (+ chain), unencrypted key
+#   bin/install-cert cert.pem key.pem     # server certificate first, then its chain;
+#                                         # unencrypted key
 #
 # Checks that the key belongs to the certificate, that it has not expired and
 # that it covers every name in DOMAINS, then writes
-# certs/live/<PRIMARY_DOMAIN>/{fullchain,privkey}.pem, server certificate
-# first. Runs in the nginx container, so the host needs no openssl.
+# certs/live/<PRIMARY_DOMAIN>/{fullchain,privkey}.pem. Runs in the nginx
+# container, so the host needs no openssl.
 # PFX_PASSWORD in the environment skips the prompt.
 set -euo pipefail
 
@@ -29,30 +30,24 @@ set -eu
 fail() { echo "install-cert: $*" >&2; exit 1; }
 pem() { sed -n "/-----BEGIN/,/-----END/p"; }
 if [ -e in2 ]; then
+    pem < in1 > full.pem
     pem < in2 > key.pem
-    key=$(openssl pkey -in key.pem -pubout 2>/dev/null) || fail "not a readable unencrypted private key"
-    pem < in1 | awk "/BEGIN CERTIFICATE/{n++} {print > (\"part\" n \".pem\")}"
-    : > leaf.pem; : > chain.pem
-    for c in part*.pem; do
-        if [ "$(openssl x509 -in "$c" -pubkey -noout)" = "$key" ]; then cat "$c" >> leaf.pem; else cat "$c" >> chain.pem; fi
-    done
 else
     p12() { openssl pkcs12 -in in1 -passin env:PFX_PASSWORD "$@" 2>/dev/null || openssl pkcs12 -legacy -in in1 -passin env:PFX_PASSWORD "$@"; }
     p12 -nocerts -nodes | pem > key.pem
-    p12 -clcerts -nokeys | pem > leaf.pem
-    p12 -cacerts -nokeys | pem > chain.pem
+    { p12 -clcerts -nokeys; p12 -cacerts -nokeys; } | pem > full.pem
 fi
 [ -s key.pem ] || fail "no private key found (wrong password?)"
-[ -s leaf.pem ] && [ "$(openssl x509 -in leaf.pem -pubkey -noout)" = "$(openssl pkey -in key.pem -pubout)" ] \
-    || fail "no certificate belongs to the private key"
-openssl x509 -in leaf.pem -noout -checkend 0 >/dev/null || fail "the certificate has expired"
+[ "$(openssl x509 -in full.pem -pubkey -noout)" = "$(openssl pkey -in key.pem -pubout)" ] \
+    || fail "the first certificate does not belong to the private key (the server certificate must come first)"
+openssl x509 -in full.pem -noout -checkend 0 >/dev/null || fail "the certificate has expired"
 for d in $DOMAINS; do
-    openssl x509 -in leaf.pem -noout -checkhost "$d" | grep -q "does match" || fail "the certificate does not cover $d (in DOMAINS)"
+    openssl x509 -in full.pem -noout -checkhost "$d" | grep -q "does match" || fail "the certificate does not cover $d (in DOMAINS)"
 done
-openssl x509 -in leaf.pem -noout -subject -issuer -enddate
+openssl x509 -in full.pem -noout -subject -issuer -enddate
 live=/etc/letsencrypt/live/$PRIMARY_DOMAIN
 mkdir -p "$live"
-cat leaf.pem chain.pem > "$live/fullchain.new"
+cp full.pem "$live/fullchain.new"
 install -m 600 key.pem "$live/privkey.pem"
 mv -f "$live/fullchain.new" "$live/fullchain.pem"
 rm -f "$live/.bootstrap"

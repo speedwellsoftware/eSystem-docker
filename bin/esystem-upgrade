@@ -5,9 +5,9 @@
 #   bin/esystem-upgrade <build URL or file, e.g. .../4.9.12013.tar.gz>
 #
 # While the site keeps running: downloads and unpacks the build into
-# build.new/ and backs up the database; any failure up to here exits 3 with
-# the site untouched. Then stops the site, swaps the build in (the previous
-# one stays in build.old/), builds images, starts the site and shows its logs.
+# build.new/, then pulls and builds the images; any failure up to here exits 3
+# with the site untouched. Then stops the site, swaps the build in (the
+# previous one stays in build.old/), starts the site and shows its logs.
 set -euo pipefail
 
 [ $# -eq 1 ] || { echo "Usage: $0 <build URL or file>" >&2; exit 2; }
@@ -30,9 +30,10 @@ for f in esystem-api/Speedwell.Api.dll delivery-api/Speedwell.WebDelivery.dll es
     [ -f "build.new/$f" ] || untouched "${SRC} is not an eSystem build (no $f)"
 done
 
+echo "==> pull and build images"
+docker compose pull --ignore-buildable && docker compose build || untouched "images could not be pulled or built"
+
 if [ -d build ]; then
-    echo "==> back up the database"
-    bin/db-backup || untouched "database backup failed"
     echo "==> stop the site"
     docker compose down --remove-orphans
 fi
@@ -41,7 +42,7 @@ echo "==> install build ${VERSION}"
 rm -rf build.old
 if [ -d build ]; then mv build build.old; fi
 mv build.new build
-docker compose up -d --build
+docker compose up -d
 docker compose ps
 if [ -t 1 ]; then
     echo "==> logs (Ctrl-C stops showing them; the site keeps running)"

@@ -161,7 +161,7 @@ self-signed certificate, and browsers show a warning.
 
 When IT renews the certificate, run step 3 again with the new file.
 
-A certificate delivered as PEM files instead (certificate with its chain,
+A certificate delivered as PEM files instead (server certificate first, then its chain,
 and an unencrypted private key) is installed the same way:
 
     bin/install-cert server.pem server.key
@@ -218,22 +218,22 @@ must belong to the branch: a 5.0 build goes with `v5.0`.
 
 `bin/upgrade`:
 
-1. fetches branch `v5.0` of this repository and switches to it, keeping your
+1. backs up the database into `backup/`, with the version you run now,
+2. fetches branch `v5.0` of this repository and switches to it, keeping your
    edits to its files,
-2. runs that branch's `bin/esystem-upgrade`, so the new version installs
+3. runs that branch's `bin/esystem-upgrade`, so the new version installs
    itself with its own steps, which
-3. downloads the build and checks it is an eSystem build of that version,
-4. backs up the database into `backup/`,
-5. stops the site,
-6. installs the new build (the previous one is kept in `build.old/`),
-7. builds the new images and starts the site,
-8. shows the logs as the site starts (Ctrl-C stops showing them; the site
+4. downloads the build and checks it is an eSystem build of that version,
+5. pulls and builds the new images,
+6. stops the site (the downtime starts here, usually 10 to 20 seconds),
+7. installs the new build (the previous one is kept in `build.old/`),
+8. starts the site and shows its logs (Ctrl-C stops showing them; the site
    keeps running).
 
-The site keeps running through steps 1 to 4. If step 3 or 4 fails,
-`bin/upgrade` switches back to the previous branch and nothing has changed.
-The first requests after an upgrade can take a minute while the application
-updates the database.
+The site keeps running through steps 1 to 5. If step 4 or 5 fails,
+`bin/upgrade` switches back to the previous branch and the site is as it
+was. The first requests after an upgrade can take a minute while the
+application updates the database.
 
 A fix published for the version you already run, without a new build:
 
@@ -246,7 +246,7 @@ A fix published for the version you already run, without a new build:
 `.env`, `build/`, `data/`, `db_data/`, `certs/` and `backup/` are not in the
 repository and an upgrade never touches them. Edits to files that are in it
 (e.g. `config/esystem/api/appsettings.production.json`) are carried over.
-If the new version changed the same file, `bin/upgrade` stops at step 1,
+If the new version changed the same file, `bin/upgrade` stops at step 2,
 before anything changes, and says so. Then: save your copy of the file,
 discard your edit with `git checkout -- <file>`, run `bin/upgrade`
 again, and re-apply your edit to the new file.
@@ -254,7 +254,7 @@ again, and re-apply your edit to the new file.
 ### Rollback
 
 An upgrade changes the database, so going back means restoring the backup
-`bin/upgrade` made in step 4 (the newest file in `backup/` from before the
+`bin/upgrade` made in step 1 (the newest file in `backup/` from before the
 upgrade):
 
     cd /srv/esystem
@@ -375,7 +375,7 @@ buffers. Raise the kernel limits so they take effect:
   existing installations build the new image on their next `up`.
 - Everything the dotnet image downloads (the `.deb` packages and the Core
   fonts cabinets) is listed in `docker/dotnet/deps.txt` with its sha256 and
-  addresses. A server without internet access can place those files in
+  address. A server without internet access can place those files in
   `docker/dotnet/` under the names in the first column. wkhtmltopdf is
   LGPL-3.0, source at <https://github.com/wkhtmltopdf/wkhtmltopdf>. Never
   commit font files: the Microsoft EULA forbids shipping them in a product.

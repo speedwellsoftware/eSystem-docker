@@ -6,19 +6,16 @@ COPY lazy-proxy/* .
 RUN go build -ldflags="-s -w" -o lazy-proxy .
 
 # Downloads listed in deps.txt (three .debs, the Core fonts cabinets): a file
-# of that name in this directory is used as is, else its addresses are tried
-# in order; either way it must match its sha256. Fonts are the .ttf files in
-# fonts/ when supplied, else the twelve in the cabinets.
+# of that name in this directory is used as is, else it is downloaded; either
+# way it must match its sha256. Fonts are the .ttf files in fonts/ when
+# supplied, else the twelve in the cabinets.
 FROM alpine:3.24 AS deps
 RUN apk add --no-cache cabextract curl
 COPY . /in/
 RUN set -eu; cd /in; mkdir /out /fonts; \
-    grep -v '^#' deps.txt | while read -r name sum urls; do \
-        [ -n "$name" ] || continue; \
-        if [ -f "$name" ]; then cp "$name" /out/; \
-        else for u in $urls; do curl -fsSL --retry 3 -o "/out/$name" "$u" && break; done; fi; \
-        echo "$sum  /out/$name" | sha256sum -c \
-            || { echo "$name: no copy matching sha256 $sum; place it in docker/dotnet/ (deps.txt)" >&2; exit 1; }; \
+    grep -v -e '^#' -e '^$' deps.txt | while read -r name sum url; do \
+        if [ -f "$name" ]; then cp "$name" /out/; else curl -fsSL --retry 3 -o "/out/$name" "$url"; fi; \
+        echo "$sum  /out/$name" | sha256sum -c; \
     done; \
     if ls fonts/*.[Tt][Tt][Ff] >/dev/null 2>&1; then cp fonts/*.[Tt][Tt][Ff] /fonts/; \
     else for f in /out/*.exe; do cabextract -q -L -F '*.ttf' -d /fonts "$f"; done; fi; \
