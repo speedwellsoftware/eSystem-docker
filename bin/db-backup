@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# db-backup: dump the database to backup/esystem-<UTC time>.sql.zst while the
+# site keeps running, and delete dumps there older than BACKUP_KEEP_DAYS (14).
+# Copy them off this server: a backup on the same disk dies with it.
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+mkdir -p -m 700 backup
+FILE="backup/esystem-$(date -u +%Y%m%dT%H%M%SZ).sql.zst"
+trap 'rm -f "${FILE}.partial"' EXIT
+
+docker compose up -d --wait db
+docker compose exec -T db pg_dump -U postgres esystem | zstd -q -T0 -o "${FILE}.partial"
+mv "${FILE}.partial" "${FILE}"
+echo "==> $(du -h "${FILE}" | cut -f1) ${FILE}"
+
+find backup -maxdepth 1 -name 'esystem-*.sql.zst' -mtime "+${BACKUP_KEEP_DAYS:-14}" -print -delete

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# esystem-upgrade: install a build of the checked-out branch's version. Run by
+# bin/upgrade after it has switched to the branch.
+#
+#   bin/esystem-upgrade <build URL or file, e.g. .../4.9.12013.tar.gz>
+#
+# While the site keeps running: downloads and unpacks the build into
+# build.new/ and backs up the database; any failure up to here exits 3 with
+# the site untouched. Then stops the site, swaps the build in (the previous
+# one stays in build.old/), builds images, starts the site and shows its logs.
+set -euo pipefail
+
+[ $# -eq 1 ] || { echo "Usage: $0 <build URL or file>" >&2; exit 2; }
+SRC="$1"
+[[ "${SRC}" =~ ^https?:// ]] || SRC="file://$(readlink -f "${SRC}")"
+cd "$(dirname "$(readlink -f "$0")")/.."
+untouched() { echo "esystem-upgrade: $*" >&2; exit 3; }
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+FILE="${SRC##*/}"
+[[ "${FILE%%\?*}" =~ ^(([0-9]+\.[0-9]+)\.[0-9]+)\.tar\.gz$ ]] || untouched "${SRC} is not a <version>.tar.gz"
+VERSION="${BASH_REMATCH[1]}"
+[ "${BRANCH}" = "v${BASH_REMATCH[2]}" ] || untouched "build ${VERSION} is not for branch ${BRANCH}"
+
+echo "==> get build ${VERSION}"
+rm -rf build.new && mkdir build.new
+trap 'rm -rf build.new' EXIT
+curl -fL --retry 3 "${SRC}" | tar xzf - -C build.new || untouched "could not download or unpack ${SRC}"
+for f in esystem-api/Speedwell.Api.dll delivery-api/Speedwell.WebDelivery.dll esystem-www/index.html delivery-www/index.html; do
+    [ -f "build.new/$f" ] || untouched "${SRC} is not an eSystem build (no $f)"
+done
+
+if [ -d build ]; then
+    echo "==> back up the database"
+    bin/db-backup || untouched "database backup failed"
+    echo "==> stop the site"
+    docker compose down --remove-orphans
+fi
+
+echo "==> install build ${VERSION}"
+rm -rf build.old
+if [ -d build ]; then mv build build.old; fi
+mv build.new build
+docker compose up -d --build
+docker compose ps
+if [ -t 1 ]; then
+    echo "==> logs (Ctrl-C stops showing them; the site keeps running)"
+    docker compose logs -f --tail 20
+fi

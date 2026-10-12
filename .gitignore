@@ -1,0 +1,23 @@
+# Site state and settings: created on the server, never committed.
+/.env
+/build/
+/build.new/
+/build.new.tar.gz
+/build.old/
+/data/
+/db_data/
+/certs/
+/acme/
+/backup/
+/seb/
+/config/nginx/*.conf
+/config/nginx/*.template
+
+# Licensed fonts supplied per installation (docker/dotnet/fonts/README.md).
+/docker/dotnet/fonts/*
+!/docker/dotnet/fonts/README.md
+
+# Downloaded by the image build (docker/dotnet/deps.txt); a copy placed here
+# by hand is used instead.
+/docker/dotnet/*.deb
+/docker/dotnet/*.exe

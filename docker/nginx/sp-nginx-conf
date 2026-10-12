@@ -1,0 +1,167 @@
+#!/bin/sh
+set -eu
+
+# sp-nginx-conf - render, test and promote the nginx config inside the
+# container. /etc/nginx/sp-src is docker/nginx/conf mounted read-only from
+# the checkout; /etc/nginx/sp-baked is the copy built into the image.
+# /etc/nginx/sp-site is config/nginx: a nginx.conf.template there replaces the
+# shared one, and allow.conf (nginx `allow <cidr>;` lines) restricts the site
+# to its entries.
+#
+#   boot    container start: the mounted tree, else the baked one
+#   check   render + nginx -t the mounted tree, change nothing
+#   reload  check, then promote the mounted tree and reload nginx
+#   status  the live generation, its source, and whether the mounted tree
+#           differs from it
+#
+# Every render lands in its own dir under /etc/nginx/gen with its includes
+# pointing into that dir, and /etc/nginx/nginx.conf is a symlink to the
+# promoted one. Only a render that passed nginx -t is ever linked, so a HUP
+# from certbot or a container restart never picks up an untested file.
+
+SRC=/etc/nginx/sp-src
+BAKED=/etc/nginx/sp-baked
+SITE=/etc/nginx/sp-site
+GEN=/etc/nginx/gen
+LIVE=/etc/nginx/nginx.conf
+KEEP=5
+
+log() { echo "[sp-nginx-conf] $*" >&2; }
+
+access() {
+    [ -e "$SITE/allow.conf" ] || return 0
+    cp "$SITE/allow.conf" "$1/allow.site"
+    echo "include $1/allow.site;"
+    echo "deny all;"
+}
+
+template_of() {
+    if [ "$1" = "$SRC" ] && [ -r "$SITE/nginx.conf.template" ]; then
+        echo "$SITE/nginx.conf.template"
+    else
+        echo "$1/nginx.conf.template"
+    fi
+}
+
+source_of() {
+    if [ "$(template_of "$SRC")" = "$SITE/nginx.conf.template" ]; then
+        echo "mounted, instance template"
+    else
+        echo mounted
+    fi
+}
+
+render() {
+    src=$1
+    tmpl=$(template_of "$src")
+    if [ ! -r "$tmpl" ]; then
+        log "no $tmpl"
+        return 1
+    fi
+    mkdir -p "$GEN"
+    dir=$(mktemp -d "$GEN/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")
+    chmod 755 "$dir"
+    cp "$src"/*.conf "$dir/"
+    cp "$tmpl" "$dir/nginx.conf.template"
+    if ! (access "$dir" > "$dir/client.access"); then
+        rm -rf "$dir"
+        return 1
+    fi
+    [ -s "$dir/client.access" ] || rm -f "$dir/client.access"
+    SP_CONF_DIR=$dir envsubst '${PRIMARY_DOMAIN} ${DOMAINS} ${HTTPS_PORT} ${SP_CONF_DIR}' \
+        < "$tmpl" > "$dir/nginx.conf"
+    if ! nginx -t -q -c "$dir/nginx.conf"; then
+        log "nginx -t failed for $tmpl"
+        rm -rf "$dir"
+        return 1
+    fi
+    echo "$dir"
+}
+
+promote() {
+    echo "$2" > "$1/source"
+    ln -s "$1/nginx.conf" "$LIVE.new.$$"
+    mv -f "$LIVE.new.$$" "$LIVE"
+    current=$(dirname "$(readlink "$LIVE")")
+    ls -1d "$GEN"/*/ | sed 's|/$||' | grep -vxF "$current" \
+        | awk -v keep=$KEEP '{ d[NR] = $0 } END { for (i = 1; i <= NR - keep; i++) print d[i] }' \
+        | while read -r old; do rm -rf "$old"; done
+    log "live: $1 ($2)"
+}
+
+live_dir() {
+    if [ -L "$LIVE" ]; then dirname "$(readlink "$LIVE")"; fi
+}
+
+case "${1:-}" in
+    boot)
+        if dir=$(render "$SRC"); then
+            promote "$dir" "$(source_of)"
+        else
+            log "WARNING: mounted config unusable, falling back to the baked copy"
+            dir=$(render "$BAKED")
+            promote "$dir" baked
+        fi
+        ;;
+    check)
+        dir=$(render "$SRC")
+        rm -rf "$dir"
+        log "ok: $(source_of) passes nginx -t"
+        ;;
+    reload)
+        dir=$(render "$SRC")
+        before=$(pgrep -f 'nginx: worker' | sort)
+        promote "$dir" "$(source_of)"
+        nginx -s reload
+        i=0
+        while [ $i -lt 20 ]; do
+            if pgrep -f 'nginx: worker' | sort | grep -qvxF "$before"; then
+                log "reloaded"
+                exit 0
+            fi
+            sleep 0.5
+            i=$((i + 1))
+        done
+        log "no new workers 10s after the reload; see the nginx error log"
+        exit 1
+        ;;
+    status)
+        cur=$(live_dir)
+        if [ -z "$cur" ]; then
+            echo "live: none"
+            exit 1
+        fi
+        echo "live: $cur ($(cat "$cur/source" 2>/dev/null || echo unknown))"
+        if [ ! -r "$SRC/nginx.conf.template" ]; then
+            echo "mounted: absent"
+        else
+            state=identical
+            cmp -s "$(template_of "$SRC")" "$cur/nginx.conf.template" || state=differs
+            for f in "$SRC"/*.conf; do
+                cmp -s "$f" "$cur/$(basename "$f")" || state=differs
+            done
+            for f in "$cur"/*.conf; do
+                case $(basename "$f") in nginx.conf) continue ;; esac
+                [ -e "$SRC/$(basename "$f")" ] || state=differs
+            done
+            if [ -e "$SITE/allow.conf" ]; then
+                cmp -s "$SITE/allow.conf" "$cur/allow.site" || state=differs
+            elif [ -e "$cur/allow.site" ]; then
+                state=differs
+            fi
+            echo "mounted: $state"
+            if [ -r "$SITE/nginx.conf.template" ]; then
+                echo "template: instance override ($SITE/nginx.conf.template)"
+            fi
+            if [ -e "$cur/allow.site" ]; then
+                echo "allow: $(grep -c . "$cur/allow.site") entries"
+            else
+                echo "allow: everyone"
+            fi
+        fi
+        ;;
+    *)
+        echo "Usage: sp-nginx-conf boot|check|reload|status" >&2
+        exit 2
+        ;;
+esac

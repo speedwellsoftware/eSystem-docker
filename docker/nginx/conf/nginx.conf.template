@@ -1,0 +1,352 @@
+# Complete nginx config. envsubst in sp-nginx-conf resolves:
+#   ${PRIMARY_DOMAIN}  — first / canonical name, used as cert path
+#   ${DOMAINS}         — space-separated list, becomes server_name
+#   ${HTTPS_PORT}      published https port, for Alt-Svc
+#   ${SP_CONF_DIR}     the rendered generation dir, for includes
+# All `$variables` below are nginx variables and are NOT touched by envsubst
+# (sp-nginx-conf passes an explicit allow-list).
+
+# Run workers as sp (uid 1000), the owner of the whole instance tree and the
+# rest of the stack (db/apps are all user 1000). Without this, workers use the
+# image's compile-time default (nginx, uid 101) and can't write the dated
+# access files into /var/log/nginx (bind-mounted from the 1000-owned
+# data/logs/nginx). The master still starts as root to load certs and bind :80.
+user sp sp;
+
+worker_processes auto;
+worker_cpu_affinity auto;
+# Two file descriptors per proxied websocket (client + upstream), so a full
+# exam of 2000 candidates holding a delivery connection costs ~4000 before any
+# ordinary request is served. Sized well above that so a busy exam cannot run
+# a worker out of descriptors.
+worker_rlimit_nofile 65535;
+
+pid /run/nginx/nginx.pid;
+
+# Logs go to the container only (`docker compose logs nginx`); the docker
+# `local` log driver rotates them.
+error_log /dev/stderr notice;
+
+events {
+    multi_accept on;
+    # Per worker, and a proxied websocket occupies two of these (client side and
+    # upstream side). 4096 was comfortable for a room; a 2000-candidate exam is
+    # ~4000 slots for the sockets alone, spread unevenly across workers.
+    worker_connections 16384;
+    use epoll;
+}
+
+http {
+    charset utf-8;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    server_tokens off;
+    log_not_found off;
+    types_hash_max_size 4096;
+    keepalive_timeout 65;
+
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # nginx's compiled-in default root is `html` -> /etc/nginx/html, which does
+    # NOT exist in the alpine image. Point the default at a dir that exists so
+    # any request falling through to it gets a real root instead of an ENOENT.
+    # Every real location overrides this via alias/proxy_pass/return.
+    root /usr/share/nginx/html;
+
+    # Combined-log prefix first (fields 1-10 are the standard layout, so the
+    # usual one-liners keep working), then our own additions, then a format
+    # version marker. New fields go BEFORE the marker and never in the middle.
+    #   $host          the requested Host header (server_name if absent). nginx
+    #                  serves several customer domains per instance and scanners
+    #                  hit the bare EIP, so without it you cannot tell a
+    #                  domain-targeted request from an IP sweep. Until now only
+    #                  the app container logs carried it, and only for the
+    #                  requests that got past nginx.
+    #   $request_time  seconds (ms resolution) from first byte read to last byte
+    #                  written, so a slow upstream is visible in the access log
+    #                  instead of only as a user complaint.
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for" '
+                    '"$host" $request_time "v1.1"';
+
+    access_log /dev/stdout main;
+
+    # Any location with its own add_header must re-include this file —
+    # add_header there would otherwise drop all headers inherited from here.
+    include ${SP_CONF_DIR}/security-headers.conf;
+
+    # There are deliberately NO `upstream` blocks for the two apps.
+    #
+    # nginx resolves a literal hostname inside `upstream` exactly once, at
+    # config load, and then holds that address for the life of the process. The
+    # app containers have no fixed IP: `restart: always` recreates one whenever
+    # its lazy-proxy exits, and Docker hands out a fresh address from the pool.
+    # After a restart nginx is therefore proxying to an address nothing answers
+    # on (502s), and if esystem and delivery are recreated together they can end
+    # up holding each other's address — nginx then quietly sends /esystem/api/
+    # to the delivery container and vice versa. That failure is silent and
+    # total: neither app matches the other's SPEEDWELL_*_PATHBASE, so *every*
+    # API route answers 404 (empty body from delivery, `Status Code: 404` from
+    # esystem's UseStatusCodePages) until the stack is restarted. It is what
+    # took the 5a1 trial instance's API down repeatedly.
+    #
+    # The API locations below therefore name the containers through a variable,
+    # which makes nginx re-resolve them via the docker resolver (declared with
+    # the ssl block further down) on each request. The cost is upstream
+    # keepalive, which cannot be combined with a variable proxy_pass: proxied
+    # requests now open a connection per request. That is affordable here —
+    # the requests that arrive in bulk (a room pulling the app's bundles) are
+    # static files nginx serves itself, and proxied API traffic for a
+    # 2000-candidate sitting peaks in the low hundreds per second, well inside
+    # the ephemeral port budget. Websockets are unaffected: they are one
+    # long-lived connection either way.
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      '';
+    }
+
+    # Alt-Svc (security-headers.conf) must name the published port, not the
+    # container's :443.
+    map $host $h3_port {
+        default ${HTTPS_PORT};
+    }
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    # TLS 1.2: AEAD suites only (GCM + ChaCha20). Drops CBC-mode ciphers
+    # flagged WEAK by scanners; TLS 1.3 suites are fixed/secure and unaffected.
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    # Docker's embedded DNS. `valid` is deliberately short: it is how long
+    # nginx keeps sending traffic to a container's old address after it has
+    # been recreated (see the note where the upstream blocks used to be).
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    resolver_timeout 5s;
+
+    # QUIC: a new client must echo a retry token before nginx allocates a
+    # connection, so a spoofed source cannot use it as a UDP amplifier.
+    # 0-RTT stays off (ssl_early_data default): its data is replayable.
+    quic_retry on;
+    http3_stream_buffer_size 1m;
+    http3_max_concurrent_streams 32;
+
+    # Per-IP flood protection; fine-grained API rate limiting is handled
+    # at the application layer.
+    #
+    # The key is the client IP, and an exam centre NATs its whole room behind
+    # one - so this bucket has to hold a full sitting, not one candidate. Sized
+    # for 2000 candidates on a single address:
+    #
+    #   at rest   quiet: an auto-save a minute is ~34 r/s across 2000, and the
+    #             slowest fallback poll (every 10s while paused, 30s while
+    #             running) is at most 200 r/s if every socket in the room were
+    #             down at once.
+    #   at start  the spike: each device pulls the app - dozens of hashed
+    #             bundles, fonts and images - and 2000 doing that inside a
+    #             minute is well into four figures a second. A 429 on a bundle
+    #             is a broken app rather than a slow one, so the burst has to
+    #             absorb a room arriving together.
+    #
+    # Raising these is cheap; the zone holds ~160k addresses in 10m.
+    limit_req_zone $binary_remote_addr zone=general:10m rate=2000r/s;
+    limit_req_status 429;
+
+    include ${SP_CONF_DIR}/*.access;
+
+    # HTTP: ACME challenge + redirect everything else to HTTPS.
+    server {
+        listen 80;
+        server_name ${DOMAINS};
+
+        location /.well-known/acme-challenge/ {
+            allow all;
+            root /var/www/certbot;
+            default_type "text/plain";
+        }
+
+        location / {
+            return 301 https://$host$request_uri;
+        }
+    }
+
+    # HTTPS: app traffic.
+    server {
+        listen 443 ssl;
+        # One UDP socket per worker carries every QUIC connection it holds,
+        # so the buffer must absorb a room arriving at once; the default
+        # ~208k does not. Needs net.core.rmem_max/wmem_max >= 4m on the host
+        # (README, "Host tuning") or the kernel clamps it without a word.
+        listen 443 quic reuseport rcvbuf=4m sndbuf=4m;
+        http2 on;
+        server_name ${DOMAINS};
+
+        ssl_certificate     /etc/letsencrypt/live/${PRIMARY_DOMAIN}/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/${PRIMARY_DOMAIN}/privkey.pem;
+
+        proxy_http_version 1.1;
+        proxy_cache_bypass $http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Server $host;
+        # Internet-facing: replace, don't append. The peer IS the client;
+        # never trust any X-Forwarded-* they sent.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Port 443;
+
+        port_in_redirect off;
+        limit_req zone=general burst=4000 nodelay;
+
+        proxy_buffers 16 8k;
+        proxy_buffer_size 16k;
+        proxy_busy_buffers_size 16k;
+        large_client_header_buffers 16 16k;
+
+        # Default for static locations (GET-only, no bodies); API locations
+        # override below.
+        client_max_body_size 1M;
+
+        gzip on;
+        gzip_comp_level 5;
+        gzip_min_length 256;
+        gzip_vary on;
+        # Compress for a client that reached us through a forward proxy too (nginx decides that by the Via
+        # header, and the default "off" skips those responses). Exam centres and schools sit behind one, and
+        # the monitor payload of a large exam is the response that most wants compressing.
+        gzip_proxied any;
+        gzip_types
+            text/plain text/css text/javascript
+            application/javascript application/json application/x-javascript
+            application/xml application/xml+rss image/svg+xml;
+
+        location = / {
+            return 301 https://$host/delivery/;
+        }
+
+        location ~ ^/safeexambrowser/SEBClientSettings\.seb(.*) {
+            return 301 https://$host/delivery/api/secure/configure;
+        }
+
+        # Monitoring probes, answered by lazy-proxy's health listener without
+        # waking the dotnet backend — safe at any check frequency. Exact match
+        # beats the /esystem/api/ and /delivery/api/ prefixes, so these never
+        # reach the app; the real /api/users/ping|version paths still do (and
+        # still wake it).
+        location = /esystem/api/ping {
+            access_log off;
+            set $esystem_health esystem:8051;
+            proxy_pass http://$esystem_health/ping;
+        }
+
+        location = /delivery/api/ping {
+            access_log off;
+            set $delivery_health delivery:8051;
+            proxy_pass http://$delivery_health/ping;
+        }
+
+        # esystem carries long synchronous admin tasks (blueprint generation,
+        # imports, report builds) that can run well past nginx's default 60s
+        # proxy_read_timeout, producing a 504 before the app replies. Give the
+        # whole esystem API a generous window. delivery is left on the default
+        # (see below) — its API is expected to answer quickly.
+        location /esystem/api/ {
+            client_max_body_size 64M;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
+            set $esystem_api esystem:8050;
+            proxy_pass http://$esystem_api;
+        }
+
+        location = /esystem {
+            return 301 https://$host/esystem/;
+        }
+
+        location /esystem {
+            alias /usr/share/nginx/esystem;
+            gzip_static on;
+            index index.html;
+
+            location = /esystem/config.json {
+                try_files /config/config.json /config.json =404;
+            }
+
+            try_files $uri $uri/ /esystem/index.html;
+            location ~ \.html$ {
+                add_header "Cache-Control" "no-store";
+                add_header "Pragma" "no-cache";
+                add_header "Expires" "-1";
+                include ${SP_CONF_DIR}/security-headers.conf;
+            }
+            location ~ \.json$ {
+                add_header "Cache-Control" "no-store";
+                add_header "Pragma" "no-cache";
+                add_header "Expires" "-1";
+                include ${SP_CONF_DIR}/security-headers.conf;
+            }
+            # Hashed bundle output (main.<hash>.js, styles.<hash>.css, fonts).
+            # Safe to cache long-term: a new deploy emits new hashes and the
+            # no-store HTML above pulls them in on the next page load.
+            location ~* \.(?:js|css|woff2?|ttf|otf|eot|svg|png|jpg|jpeg|gif|ico|webp)$ {
+                expires 1y;
+                access_log off;
+            }
+        }
+
+        location = /delivery {
+            return 301 https://$host/delivery/;
+        }
+
+        location /delivery {
+            alias /usr/share/nginx/delivery;
+            gzip_static on;
+            index index.html;
+
+            location = /delivery/config.json {
+                try_files /config/config.json /config.json =404;
+            }
+
+            try_files $uri $uri/ /delivery/index.html;
+            location ~ \.html$ {
+                add_header "Cache-Control" "no-store";
+                add_header "Pragma" "no-cache";
+                add_header "Expires" "-1";
+                include ${SP_CONF_DIR}/security-headers.conf;
+            }
+            location ~ \.json$ {
+                add_header "Cache-Control" "no-store";
+                add_header "Pragma" "no-cache";
+                add_header "Expires" "-1";
+                include ${SP_CONF_DIR}/security-headers.conf;
+            }
+            # Hashed bundle output (main.<hash>.js, styles.<hash>.css, fonts).
+            # Safe to cache long-term: a new deploy emits new hashes and the
+            # no-store HTML above pulls them in on the next page load.
+            location ~* \.(?:js|css|woff2?|ttf|otf|eot|svg|png|jpg|jpeg|gif|ico|webp)$ {
+                expires 1y;
+                access_log off;
+            }
+        }
+
+        location ~ ^/delivery/api/media/ {
+            client_max_body_size 16M;
+            set $delivery_media delivery:8050;
+            proxy_pass http://$delivery_media;
+            proxy_buffering off;
+        }
+
+        location /delivery/api/ {
+            client_max_body_size 16M;
+            set $delivery_api delivery:8050;
+            proxy_pass http://$delivery_api;
+        }
+    }
+}

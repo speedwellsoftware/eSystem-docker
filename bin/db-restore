@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# db-restore: replace the database with a dump (from bin/db-backup, or any
+# plain pg_dump of an eSystem database, .sql or .sql.zst). Stops the site,
+# loads the dump, starts the site. Asks first unless -y is given.
+#
+#   bin/db-restore [-y] <file>
+set -euo pipefail
+
+YES=0
+if [ "${1:-}" = -y ]; then YES=1; shift; fi
+[ $# -eq 1 ] && [ -f "$1" ] || { echo "Usage: $0 [-y] <file.sql.zst | file.sql>" >&2; exit 2; }
+SRC="$(readlink -f "$1")"
+cd "$(dirname "$(readlink -f "$0")")/.."
+
+if [ "${YES}" -eq 0 ]; then
+    read -r -p "Replace the esystem database with ${SRC}? [y/N] " answer
+    [[ "${answer}" =~ ^[yY] ]] || { echo aborted; exit 1; }
+fi
+
+docker compose up -d --wait db
+docker compose stop nginx delivery esystem
+docker compose exec -T db dropdb -U postgres --if-exists --force esystem
+docker compose exec -T db createdb -U postgres esystem
+case "${SRC}" in
+    *.zst) zstd -dc "${SRC}" ;;
+    *)     cat "${SRC}" ;;
+esac | docker compose exec -T db psql -q -U postgres esystem
+# A dump carries no planner statistics; gather them before the app's queries.
+docker compose exec -T db vacuumdb -U postgres -Z -q esystem
+docker compose up -d
+echo "==> restored ${SRC}"

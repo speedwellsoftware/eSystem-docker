@@ -1,0 +1,261 @@
+# Speedwell eSystem, self-hosted: postgres + esystem + delivery + nginx (TLS)
+# + certbot (optional, Let's Encrypt). Settings are in .env (see
+# .env.example); setup and upgrade steps are in README.md.
+#
+# Images are built locally from docker/ on the first `docker compose up`. Each
+# tag is frozen for this release branch: a change under docker/ comes with a
+# new tag, so `up` builds it once and nothing rebuilds otherwise.
+
+x-logging: &logging
+    driver: "local"
+    options:
+        max-size: "10m"
+        max-file: "30"
+
+services:
+    init:
+        image: postgres:18.6-alpine3.24
+        entrypoint: ["/bin/sh", "/init.sh"]
+        user: "0:0"
+        volumes:
+            - ./docker/init.sh:/init.sh:ro
+            - ./build:/srv/build
+            - ./data:/srv/data
+            - ./db_data:/srv/db_data
+            - ./certs:/srv/certs
+            - ./acme:/srv/acme
+            - /etc/machine-id:/srv/machine-id:ro
+        network_mode: none
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        cap_add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+        restart: "no"
+
+    db:
+        image: postgres:18.6-alpine3.24
+        environment:
+            POSTGRES_DB: esystem
+            POSTGRES_HOST_AUTH_METHOD: trust
+        user: "1000:1000"
+        command: >
+            postgres
+            -c max_connections=${DB_MAX_CONNECTIONS:-220}
+            -c shared_buffers=${DB_SHARED_BUFFERS:-256MB}
+            -c effective_cache_size=${DB_EFFECTIVE_CACHE_SIZE:-1GB}
+            -c work_mem=${DB_WORK_MEM:-8MB}
+            -c maintenance_work_mem=${DB_MAINTENANCE_WORK_MEM:-128MB}
+            -c autovacuum_work_mem=64MB
+            -c random_page_cost=1.1
+            -c effective_io_concurrency=200
+            -c jit=off
+            -c log_temp_files=${DB_LOG_TEMP_FILES:--1}
+            -c log_min_duration_statement=${DB_LOG_MIN_DURATION:--1}
+        networks:
+            - backend
+        volumes:
+            - ./db_data:/var/lib/postgresql
+        read_only: true
+        tmpfs:
+            - /tmp
+            - /run/postgresql
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        deploy:
+            resources:
+                limits:
+                    memory: ${DB_MEMORY:-2g}
+                    pids: 512
+        depends_on:
+            init:
+                condition: service_completed_successfully
+        restart: always
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U postgres -q"]
+            interval: 60s
+            start_interval: 2s
+            timeout: 3s
+            retries: 10
+            start_period: 30s
+        logging: *logging
+
+    esystem:
+        image: esystem-dotnet:10.0.12
+        build: ./docker/dotnet
+        environment:
+            SPEEDWELL_API_PATHBASE: "/esystem/api"
+            ASPNETCORE_ENVIRONMENT: "Production"
+            TZ: "${TZ:-Europe/London}"
+        user: "1000:1000"
+        working_dir: /app/dotnet
+        entrypoint: /usr/local/bin/lazy-proxy -v -idle 20m -listen :8050 -forward 127.0.0.1:8080 -health :8051 dotnet /app/dotnet/Speedwell.Api.dll
+        volumes:
+            - ./data:/app/data/
+            - ./build/esystem-api:/app/dotnet/:ro
+            - ./config/esystem/api:/app/dotnet/config:ro
+            - /etc/machine-id:/var/lib/dbus/machine-id:ro
+        networks:
+            - backend
+            - frontend
+        depends_on:
+            init:
+                condition: service_completed_successfully
+            db:
+                condition: service_healthy
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        deploy:
+            resources:
+                limits:
+                    memory: ${ESYSTEM_MEMORY:-5g}
+                    pids: 2048
+        restart: always
+        logging: *logging
+
+    delivery:
+        image: esystem-dotnet:10.0.12
+        build: ./docker/dotnet
+        environment:
+            SPEEDWELL_DELIVERY_PATHBASE: "/delivery/api"
+            ASPNETCORE_ENVIRONMENT: "production"
+            TZ: "${TZ:-Europe/London}"
+        user: "1000:1000"
+        working_dir: /app/dotnet
+        entrypoint: /usr/local/bin/lazy-proxy -v -idle 20m -listen :8050 -forward 127.0.0.1:8080 -health :8051 dotnet Speedwell.WebDelivery.dll
+        volumes:
+            - ./data:/app/data/
+            - ./build/delivery-api:/app/dotnet/:ro
+            - ./config/delivery/api:/app/dotnet/config:ro
+            # SEB installers served by /delivery/api/secure/download. Defaults
+            # to the build's own copy; point DOWNLOAD_DIR at another directory
+            # to serve different installers.
+            - ${DOWNLOAD_DIR:-./build/delivery-api/wwwroot/download}:/app/dotnet/wwwroot/download:ro
+            - /etc/machine-id:/var/lib/dbus/machine-id:ro
+        networks:
+            - backend
+            - frontend
+        depends_on:
+            init:
+                condition: service_completed_successfully
+            db:
+                condition: service_healthy
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        deploy:
+            resources:
+                limits:
+                    memory: ${DELIVERY_MEMORY:-2g}
+                    pids: 2048
+        restart: always
+        logging: *logging
+
+    nginx:
+        image: esystem-nginx:1.31.6
+        build: ./docker/nginx
+        environment:
+            PRIMARY_DOMAIN: "${PRIMARY_DOMAIN:?PRIMARY_DOMAIN required}"
+            DOMAINS: "${DOMAINS:?DOMAINS required}"
+            HTTPS_PORT: "${HTTPS_PORT:-443}"
+        volumes:
+            - ./build/esystem-www:/usr/share/nginx/esystem:ro
+            - ./build/delivery-www:/usr/share/nginx/delivery:ro
+            - ./config/esystem/www:/usr/share/nginx/esystem/config:ro
+            - ./config/delivery/www:/usr/share/nginx/delivery/config:ro
+            - ./docker/nginx/conf:/etc/nginx/sp-src:ro
+            - ./config/nginx:/etc/nginx/sp-site:ro
+            - ./certs:/etc/letsencrypt
+            - ./acme:/var/www/certbot
+        tmpfs:
+            - /var/cache/nginx
+            - /run/nginx
+            - /tmp
+        networks:
+            - frontend
+        depends_on:
+            init:
+                condition: service_completed_successfully
+            esystem:
+                condition: service_started
+            delivery:
+                condition: service_started
+        ports:
+            - "${HOST_IP:-0.0.0.0}:${HTTP_PORT:-80}:80"
+            - "${HOST_IP:-0.0.0.0}:${HTTPS_PORT:-443}:443"
+            - "${HOST_IP:-0.0.0.0}:${HTTPS_PORT:-443}:443/udp"
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        cap_add:
+            - NET_BIND_SERVICE
+            - CHOWN
+            - DAC_OVERRIDE
+            - SETGID
+            - SETUID
+        deploy:
+            resources:
+                limits:
+                    memory: 512m
+                    pids: 512
+        restart: always
+        healthcheck:
+            test: ["CMD-SHELL", "nc -z 127.0.0.1 80 || exit 1"]
+            interval: 60s
+            start_interval: 2s
+            timeout: 5s
+            retries: 3
+            start_period: 30s
+        logging: *logging
+
+    # Let's Encrypt issuance and renewal over HTTP-01 on port 80. Off unless
+    # .env sets COMPOSE_PROFILES=letsencrypt.
+    certbot:
+        image: esystem-certbot:5.8.0
+        build: ./docker/certbot
+        profiles: ["letsencrypt"]
+        # Shares nginx's PID namespace so it can HUP nginx after a renewal.
+        pid: "service:nginx"
+        environment:
+            PRIMARY_DOMAIN: "${PRIMARY_DOMAIN:?PRIMARY_DOMAIN required}"
+            DOMAINS: "${DOMAINS:?DOMAINS required}"
+            LE_EMAIL: "${LE_EMAIL:-}"
+            LE_STAGING: "${LE_STAGING:-0}"
+        sysctls:
+            net.ipv6.conf.all.disable_ipv6: "1"
+        volumes:
+            - ./certs:/etc/letsencrypt
+            - ./acme:/var/www/certbot
+        networks:
+            - frontend
+        depends_on:
+            nginx:
+                condition: service_healthy
+        security_opt:
+            - no-new-privileges:true
+        cap_drop:
+            - ALL
+        cap_add:
+            - DAC_OVERRIDE
+            - CHOWN
+        deploy:
+            resources:
+                limits:
+                    memory: 128m
+                    pids: 128
+        restart: always
+        logging: *logging
+
+networks:
+    backend:
+        internal: true
+    frontend:
